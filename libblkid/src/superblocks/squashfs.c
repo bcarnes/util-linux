@@ -38,11 +38,74 @@ struct sqsh_super_block {
 	uint64_t	export_table;
 } __attribute__((packed));
 
+#define SQUASHFS_COMP_OPT_FLAG        (1<<10)
+#define SQUASHFS_EXTRA_INFO_FLAG      (1<<12)
+
+#define SQUASHFS_COMPRESSED_BIT       (1<<15)
+#define SQUASHFS_METADATA_BLOCK_MAX   8192
+
+#define SQUASHFS_EXTRA_INFO_TAG_END   0
+#define SQUASHFS_EXTRA_INFO_TAG_LABEL 1
+#define SQUASHFS_EXTRA_INFO_TAG_UUID  2
+
+static const uint8_t *get_metadata_block(blkid_probe pr, uint64_t *pofs, uint16_t *pmetablock_len)
+{
+	const uint8_t *buf = blkid_probe_get_buffer(pr, *pofs, 2);
+	if (!buf) return NULL;
+	uint16_t metablock_len = (buf[1]<<8) | buf[0];
+	if (!(metablock_len & SQUASHFS_COMPRESSED_BIT)) {
+		/* a compressed metadata block is not valid here */
+		return NULL;
+	}
+	metablock_len &= ~SQUASHFS_COMPRESSED_BIT;
+	if (metablock_len > SQUASHFS_METADATA_BLOCK_MAX) {
+		return NULL;
+	}
+	buf = blkid_probe_get_buffer(pr, *pofs + 2, metablock_len);
+	if (!buf) return NULL;
+	*pmetablock_len = metablock_len;
+	*pofs += 2 + metablock_len;
+	return buf;
+}
+
+static void probe_extra_info(blkid_probe pr, uint16_t flags)
+{
+	uint64_t ofs = sizeof(struct sqsh_super_block);
+	uint16_t metablock_len;
+	const uint8_t *buf;
+
+	/* comp_opts, when present, comes right after the superblock */
+	if (flags & SQUASHFS_COMP_OPT_FLAG) {
+		buf = get_metadata_block(pr, &ofs, &metablock_len);
+		if (!buf) return;
+	}
+
+	/* extra_info comes next */
+	buf = get_metadata_block(pr, &ofs, &metablock_len);
+	if (!buf) return;
+
+	const uint8_t *buf_end = buf + metablock_len;
+	while (buf < buf_end) {
+		unsigned char type = *buf++;
+		if (type == SQUASHFS_EXTRA_INFO_TAG_END || buf >= buf_end)
+			return;
+		unsigned char len = *buf++;
+		if (buf + len > buf_end) return;
+		if (type == SQUASHFS_EXTRA_INFO_TAG_LABEL) {
+			blkid_probe_set_label(pr, buf, len);
+		} else if (type == SQUASHFS_EXTRA_INFO_TAG_UUID) {
+			blkid_probe_set_uuid(pr, buf);
+		}
+		buf += len;
+	}
+}
+
 static int probe_squashfs(blkid_probe pr, const struct blkid_idmag *mag)
 {
 	struct sqsh_super_block *sq;
 	uint16_t vermaj;
 	uint16_t vermin;
+	uint16_t flags;
 
 	sq = blkid_probe_get_sb(pr, mag, struct sqsh_super_block);
 	if (!sq)
@@ -58,6 +121,10 @@ static int probe_squashfs(blkid_probe pr, const struct blkid_idmag *mag)
 	blkid_probe_set_block_size(pr, le32_to_cpu(sq->block_size));
 	blkid_probe_set_fssize(pr, le64_to_cpu(sq->bytes_used));
 
+	flags = le16_to_cpu(sq->flags);
+	if (flags & SQUASHFS_EXTRA_INFO_FLAG) {
+		probe_extra_info(pr, flags);
+	}
 	return 0;
 }
 
